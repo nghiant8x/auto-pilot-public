@@ -818,6 +818,7 @@ async function heartbeat() {
     machine_id: config.machineId,
     machine_name: config.machineName,
     stella_version: config.version,
+    stella_log: stellaLogEntries.join('\n') || null,
   };
 
   if (API_KEY) {
@@ -858,13 +859,23 @@ async function setOffline() {
   }
 }
 
-// ─── Stella (Agent 4): Monitor & Diagnose ───────────────────
-// Pure JavaScript monitoring — no Claude CLI.
-// Runs every ~30s, checks system health, recovers stuck tasks.
+// ─── Stella (Agent 4): Commander & Monitor ───────────────────
+// Stella is the commander overseeing Luna, Aria, Nova.
+// Uses Claude CLI for intelligent analysis and Vietnamese reports.
+// Runs every ~2 min, provides comprehensive status reports.
 
 let stellaCycleCount = 0;
-const STELLA_INTERVAL_CYCLES = 6; // Run every 6 poll cycles (~30s at 5s poll)
+const STELLA_INTERVAL_CYCLES = 24; // Run every 24 poll cycles (~2 min at 5s poll)
 let lastStellaMessage = '';
+const STELLA_LOG_MAX = 50;
+const stellaLogEntries = [];
+
+function stellaLog(message) {
+  const now = new Date();
+  const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+  stellaLogEntries.push(`[${time}] ${message}`);
+  if (stellaLogEntries.length > STELLA_LOG_MAX) stellaLogEntries.shift();
+}
 
 async function checkClaudeCli() {
   try {
@@ -921,7 +932,9 @@ async function checkAndRecoverStuckTasks() {
 
     const minutesStuck = Math.round((now - updatedAt) / 60000);
     await updateTask(t.id, { status: resetStatus });
-    await log(t.id, `💫 Stella: Phục hồi task bị kẹt (${t.status} → ${resetStatus}, kẹt ${minutesStuck} phút)`);
+    const recoverMsg = `Phục hồi #${t.task_number} (${t.status} → ${resetStatus}, kẹt ${minutesStuck}p)`;
+    await log(t.id, `💫 Stella: ${recoverMsg}`);
+    stellaLog(`♻️ ${recoverMsg}`);
     console.log(`💫 Stella: Reset #${t.task_number} ${t.status} → ${resetStatus} (stuck ${minutesStuck}m)`);
     recovered++;
   }
@@ -956,10 +969,37 @@ async function checkRecentErrors() {
   return { count: 0 };
 }
 
+async function getTaskPipelineStatus() {
+  const projectIds = [...projectConfigs.keys()];
+  if (!projectIds.length) return { pipeline: {}, recentFailed: [] };
+  try {
+    const { data } = await supabase
+      .from('tasks')
+      .select('status, project_id, title, description, agent_log, task_number')
+      .in('project_id', projectIds);
+    if (!data) return { pipeline: {}, recentFailed: [] };
+
+    const pipeline = { draft: 0, qualifying: 0, qualified: 0, awaiting_approval: 0, in_progress: 0, implemented: 0, reviewing: 0, deployed: 0, done: 0, failed: 0, needs_improvement: 0 };
+    const recentFailed = [];
+    for (const t of data) {
+      if (pipeline[t.status] !== undefined) pipeline[t.status]++;
+      if (t.status === 'failed') {
+        recentFailed.push({
+          number: t.task_number,
+          title: t.title || t.description?.slice(0, 60),
+          last_log: t.agent_log?.split('\n').filter(Boolean).slice(-2).join(' | ') || 'No log',
+        });
+      }
+    }
+    return { pipeline, recentFailed: recentFailed.slice(0, 5) };
+  } catch { return { pipeline: {}, recentFailed: [] }; }
+}
+
 async function stellaMonitor() {
   stellaCycleCount++;
   if (stellaCycleCount % STELLA_INTERVAL_CYCLES !== 0) return;
 
+  // Phase 1: Health checks (pure JS, fast)
   const checks = {
     claudeCli: await checkClaudeCli(),
     connection: await checkConnection(),
@@ -973,15 +1013,33 @@ async function stellaMonitor() {
   if (checks.stuckTasks.message) issues.push(checks.stuckTasks.message);
   if (checks.recentErrors.count > 0) issues.push(checks.recentErrors.message);
 
-  const stellaMessage = issues.length > 0
-    ? `⚠️ ${issues.join(' | ')}`
-    : null; // No message when healthy — keep UI clean
+  // Phase 2: Gather pipeline data
+  const { pipeline, recentFailed } = await getTaskPipelineStatus();
 
-  const lastError = !checks.claudeCli.ok ? checks.claudeCli.message
-    : !checks.connection.ok ? checks.connection.message
-    : null;
+  // Phase 3: Claude analysis — ALWAYS (Stella is the commander)
+  let stellaMessage;
+  let lastError = null;
 
-  // Report to all configured projects
+  // If Claude CLI is down, can't call Claude — use fallback
+  if (!checks.claudeCli.ok) {
+    stellaMessage = `🔴 ${checks.claudeCli.message}`;
+    lastError = checks.claudeCli.message;
+    stellaLog(stellaMessage);
+  } else {
+    try {
+      const report = await stellaReport(checks, issues, pipeline, recentFailed);
+      stellaMessage = report.message;
+      lastError = report.error;
+      stellaLog(report.logEntry);
+    } catch (e) {
+      stellaMessage = issues.length > 0
+        ? `⚠️ ${issues.join(' | ')}`
+        : '✅ Hệ thống bình thường';
+      stellaLog(stellaMessage);
+    }
+  }
+
+  // Phase 4: Report to all projects
   for (const [projectId] of projectConfigs) {
     await reportStellaStatus(projectId, {
       stella_message: stellaMessage,
@@ -990,12 +1048,104 @@ async function stellaMonitor() {
     });
   }
 
-  // Log only when status changes
-  const msg = stellaMessage || '✅ Hệ thống bình thường';
-  if (msg !== lastStellaMessage) {
-    console.log(`💫 Stella: ${msg}`);
-    lastStellaMessage = msg;
+  // Console log
+  if (stellaMessage !== lastStellaMessage) {
+    console.log(`💫 Stella: ${stellaMessage}`);
+    lastStellaMessage = stellaMessage;
   }
+}
+
+// Stella — Commander: uses Claude with tools to investigate, fix, and report
+async function stellaReport(checks, issues, pipeline, recentFailed) {
+  const uptimeMin = Math.round((stellaCycleCount * POLL_INTERVAL) / 60000);
+
+  const systemStatus = {
+    infrastructure: {
+      claude_cli: checks.claudeCli.ok ? '✅ OK' : `❌ ${checks.claudeCli.message}`,
+      supabase: checks.connection.ok ? '✅ OK' : `❌ ${checks.connection.message}`,
+    },
+    pipeline: {
+      waiting: (pipeline.draft || 0) + (pipeline.needs_improvement || 0),
+      luna_qualifying: pipeline.qualifying || 0,
+      awaiting_approval: pipeline.awaiting_approval || 0,
+      aria_implementing: (pipeline.qualified || 0) + (pipeline.in_progress || 0),
+      nova_reviewing: (pipeline.implemented || 0) + (pipeline.reviewing || 0),
+      deployed: pipeline.deployed || 0,
+      done: pipeline.done || 0,
+      failed: pipeline.failed || 0,
+    },
+    agents: {
+      active_tasks_now: activeTasks.size,
+      total_completed_session: totalCompleted,
+      uptime: `${uptimeMin} phút`,
+      projects_monitored: projectConfigs.size,
+    },
+    issues_detected: issues.length > 0 ? issues : ['Không có vấn đề'],
+    stuck_tasks_recovered: checks.stuckTasks.recovered || 0,
+    recent_failed_tasks: recentFailed.length > 0 ? recentFailed : 'Không có',
+  };
+
+  const hasIssues = issues.length > 0 || recentFailed.length > 0;
+
+  const prompt = `Bạn là Stella — chỉ huy giám sát hệ thống Autopilot, quản lý 3 agent:
+- 🌙 Luna: đánh giá yêu cầu người dùng
+- 🎵 Aria: implement code, commit, push
+- ⭐ Nova: review code, merge, deploy
+
+Dữ liệu hệ thống hiện tại:
+${JSON.stringify(systemStatus, null, 2)}
+
+${hasIssues ? `CÓ VẤN ĐỀ CẦN XỬ LÝ. Hãy:
+1. Dùng các tool (Read, Grep, Bash) để điều tra nguyên nhân gốc
+2. Nếu có thể tự fix (vd: config sai, file thiếu) — hãy fix luôn
+3. Nếu không thể tự fix — đề xuất cụ thể cho người quản lý
+
+Ví dụ: nếu task fail do lỗi code, hãy đọc agent_log để hiểu lỗi gì. Nếu file config sai, sửa nó.` : `Hệ thống đang ổn. Hãy báo cáo ngắn gọn.`}
+
+Sau khi điều tra và xử lý xong, trả lời JSON ở cuối:
+{
+  "status": "healthy" | "warning" | "critical",
+  "summary": "Tóm tắt 1 dòng",
+  "details": "Báo cáo 2-5 dòng: tình trạng pipeline, hành động đã thực hiện, đề xuất cho user nếu cần",
+  "actions_taken": ["mô tả hành động đã thực hiện"] hoặc [],
+  "needs_user_action": null hoặc "mô tả điều cần user xử lý",
+  "error": null hoặc "lỗi nghiêm trọng nhất"
+}
+
+Quy tắc:
+- Viết tiếng Việt, thân thiện, ngắn gọn
+- Nếu bình thường: báo cáo tích cực, không cần dài dòng
+- Nếu có vấn đề: điều tra → xử lý → báo cáo chi tiết
+- "needs_user_action" chỉ khi thực sự cần user can thiệp (vd: cài đặt phần mềm, cấp quyền)`;
+
+  // Give Stella access to tools for investigation and action
+  const allowedTools = hasIssues
+    ? ['Read', 'Glob', 'Grep', 'Bash', 'Edit']  // Full power when issues detected
+    : [];  // No tools needed for routine report
+
+  const result = await claudeQuery({
+    prompt,
+    maxTurns: hasIssues ? 10 : 1,  // More turns when investigating
+    allowedTools,
+    systemPrompt: 'Bạn là Stella, chỉ huy giám sát hệ thống Autopilot. Bạn có quyền điều tra và xử lý vấn đề. Trả lời cuối cùng phải chứa JSON hợp lệ. Viết tiếng Việt.',
+  });
+
+  const report = parseJson(result.result);
+  const icon = report.status === 'critical' ? '🔴' : report.status === 'warning' ? '🟡' : '✅';
+
+  let message = `${icon} ${report.summary}\n${report.details}`;
+  if (report.actions_taken?.length) {
+    message += `\n🔧 Đã xử lý: ${report.actions_taken.join(', ')}`;
+  }
+  if (report.needs_user_action) {
+    message += `\n👤 Cần bạn: ${report.needs_user_action}`;
+  }
+
+  return {
+    message,
+    error: report.error || null,
+    logEntry: `${icon} ${report.summary}${report.actions_taken?.length ? ` [đã xử lý ${report.actions_taken.length} vấn đề]` : ''}`,
+  };
 }
 
 async function main() {
