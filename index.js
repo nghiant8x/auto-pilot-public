@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, existsSync } from 'fs';
+import { readFileSync, mkdtempSync, existsSync } from 'fs';
 import { join, extname } from 'path';
 import { tmpdir, homedir } from 'os';
 import { pipeline } from 'stream/promises';
@@ -50,10 +50,6 @@ let projectConfigs = new Map();
 
 function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
   return new Promise((resolve, reject) => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'autopilot-'));
-    const promptFile = join(tmpDir, 'prompt.txt');
-    writeFileSync(promptFile, prompt, 'utf-8');
-
     const claudeArgs = ['--output-format', 'json', '--model', 'opus', '--effort', 'high'];
     if (maxTurns) claudeArgs.push('--max-turns', String(maxTurns));
     if (allowedTools?.length) {
@@ -62,9 +58,6 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
       }
     }
     if (systemPrompt) claudeArgs.push('--system-prompt', systemPrompt);
-
-    const promptFilePosix = promptFile.replace(/\\/g, '/');
-    const shellCmd = `claude -p "$(cat '${promptFilePosix}')" ${claudeArgs.join(' ')}`;
 
     // Sanitize environment — strip sensitive vars before passing to Claude
     const SENSITIVE_ENV_PREFIXES = [
@@ -81,11 +74,16 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
       env[k] = v;
     }
 
-    const child = spawn('bash', ['-c', shellCmd], {
+    const child = spawn('claude', ['-p', ...claudeArgs], {
       cwd: cwd || process.cwd(),
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: true,
     });
+
+    // Pipe prompt via stdin (cross-platform, no bash dependency)
+    child.stdin.write(prompt);
+    child.stdin.end();
 
     let stdout = '';
     let stderr = '';
@@ -97,14 +95,8 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
       reject(new Error('Claude CLI timeout (30 min)'));
     }, 30 * 60 * 1000);
 
-    const cleanup = () => {
-      try { unlinkSync(promptFile); } catch {}
-      try { require('fs').rmdirSync(tmpDir); } catch {}
-    };
-
     child.on('close', (code) => {
       clearTimeout(timer);
-      cleanup();
       if (code !== 0) {
         reject(new Error(`Claude CLI exited with code ${code}\n${stderr}`));
         return;
@@ -123,7 +115,6 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
-      cleanup();
       reject(new Error(`Claude CLI error: ${err.message}`));
     });
   });
