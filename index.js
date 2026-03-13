@@ -713,7 +713,10 @@ async function pollAndDispatch() {
       }
       return;
     }
-    const { tasks: allTasks, configs } = await res.json();
+    const { tasks: allTasks, configs, stuck_tasks } = await res.json();
+
+    // Cache stuck tasks for Stella monitoring
+    cachedStuckTasks = stuck_tasks || [];
 
     // Update project configs cache
     if (configs) {
@@ -806,6 +809,7 @@ async function pollAndDispatch() {
 }
 
 let totalCompleted = 0;
+let cachedStuckTasks = [];
 
 async function heartbeat() {
   const heartbeatData = {
@@ -854,27 +858,149 @@ async function setOffline() {
   }
 }
 
-async function recoverStuckTasks() {
-  const { data: stuck } = await supabase
-    .from('tasks')
-    .select('id, task_number, status')
-    .in('status', ['qualifying', 'in_progress', 'reviewing']);
-  if (stuck?.length) {
-    console.log(`♻️  Recovering ${stuck.length} stuck task(s)...`);
-    for (const t of stuck) {
-      // Reset qualifying → draft, in_progress → qualified, reviewing → implemented
-      const resetStatus = t.status === 'qualifying' ? 'draft'
-        : t.status === 'in_progress' ? 'qualified'
-        : 'implemented';
-      await supabase.from('tasks').update({ status: resetStatus }).eq('id', t.id);
-      console.log(`   Reset #${t.task_number} ${t.status} → ${resetStatus}`);
-    }
+// ─── Stella (Agent 4): Monitor & Diagnose ───────────────────
+// Pure JavaScript monitoring — no Claude CLI.
+// Runs every ~30s, checks system health, recovers stuck tasks.
+
+let stellaCycleCount = 0;
+const STELLA_INTERVAL_CYCLES = 6; // Run every 6 poll cycles (~30s at 5s poll)
+let lastStellaMessage = '';
+
+async function checkClaudeCli() {
+  try {
+    const { execSync } = await import('child_process');
+    execSync('claude --version', { stdio: 'pipe', timeout: 5000, shell: true });
+    return { ok: true };
+  } catch {
+    return { ok: false, message: 'Claude CLI không khả dụng (spawn ENOENT)' };
+  }
+}
+
+async function checkConnection() {
+  if (!API_KEY) return { ok: true }; // Legacy mode uses direct DB
+  try {
+    const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-heartbeat`, {
+      method: 'POST',
+      headers: agentHeaders(),
+      body: JSON.stringify({ machine_id: config.machineId, active_tasks: activeTasks.size }),
+      signal: AbortSignal.timeout(10000),
+    });
+    return res.ok ? { ok: true } : { ok: false, message: `Mất kết nối Supabase (${res.status})` };
+  } catch {
+    return { ok: false, message: 'Mất kết nối Supabase' };
+  }
+}
+
+const STUCK_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+async function checkAndRecoverStuckTasks() {
+  // Use cached stuck_tasks from agent-poll (API key mode) or direct query (legacy)
+  let stuck = cachedStuckTasks;
+  if (!API_KEY) {
+    const { data } = await supabase
+      .from('tasks')
+      .select('id, task_number, status, updated_at, project_id')
+      .in('status', ['qualifying', 'in_progress', 'reviewing']);
+    stuck = data || [];
+  }
+
+  if (!stuck.length) return { recovered: 0 };
+
+  const now = Date.now();
+  let recovered = 0;
+
+  for (const t of stuck) {
+    if (activeTasks.has(t.id)) continue;
+
+    const updatedAt = new Date(t.updated_at).getTime();
+    if (now - updatedAt < STUCK_THRESHOLD_MS) continue;
+
+    const resetStatus = t.status === 'qualifying' ? 'draft'
+      : t.status === 'in_progress' ? 'qualified'
+      : 'implemented';
+
+    const minutesStuck = Math.round((now - updatedAt) / 60000);
+    await updateTask(t.id, { status: resetStatus });
+    await log(t.id, `💫 Stella: Phục hồi task bị kẹt (${t.status} → ${resetStatus}, kẹt ${minutesStuck} phút)`);
+    console.log(`💫 Stella: Reset #${t.task_number} ${t.status} → ${resetStatus} (stuck ${minutesStuck}m)`);
+    recovered++;
+  }
+
+  return {
+    recovered,
+    message: recovered > 0 ? `Đã phục hồi ${recovered} task bị kẹt` : null,
+  };
+}
+
+async function checkRecentErrors() {
+  let recentFailed = [];
+  try {
+    const { data } = await supabase
+      .from('tasks')
+      .select('id, task_number, status, updated_at')
+      .eq('status', 'failed')
+      .order('updated_at', { ascending: false })
+      .limit(5);
+    recentFailed = data || [];
+  } catch { return { count: 0 }; }
+
+  const tenMinAgo = Date.now() - 10 * 60 * 1000;
+  const recent = recentFailed.filter(t => new Date(t.updated_at).getTime() > tenMinAgo);
+
+  if (recent.length >= 3) {
+    return {
+      count: recent.length,
+      message: `${recent.length} tasks thất bại trong 10 phút — kiểm tra hệ thống`,
+    };
+  }
+  return { count: 0 };
+}
+
+async function stellaMonitor() {
+  stellaCycleCount++;
+  if (stellaCycleCount % STELLA_INTERVAL_CYCLES !== 0) return;
+
+  const checks = {
+    claudeCli: await checkClaudeCli(),
+    connection: await checkConnection(),
+    stuckTasks: await checkAndRecoverStuckTasks(),
+    recentErrors: await checkRecentErrors(),
+  };
+
+  const issues = [];
+  if (!checks.claudeCli.ok) issues.push(checks.claudeCli.message);
+  if (!checks.connection.ok) issues.push(checks.connection.message);
+  if (checks.stuckTasks.message) issues.push(checks.stuckTasks.message);
+  if (checks.recentErrors.count > 0) issues.push(checks.recentErrors.message);
+
+  const stellaMessage = issues.length > 0
+    ? `⚠️ ${issues.join(' | ')}`
+    : null; // No message when healthy — keep UI clean
+
+  const lastError = !checks.claudeCli.ok ? checks.claudeCli.message
+    : !checks.connection.ok ? checks.connection.message
+    : null;
+
+  // Report to all configured projects
+  for (const [projectId] of projectConfigs) {
+    await reportStellaStatus(projectId, {
+      stella_message: stellaMessage,
+      last_active_at: new Date().toISOString(),
+      last_error: lastError,
+    });
+  }
+
+  // Log only when status changes
+  const msg = stellaMessage || '✅ Hệ thống bình thường';
+  if (msg !== lastStellaMessage) {
+    console.log(`💫 Stella: ${msg}`);
+    lastStellaMessage = msg;
   }
 }
 
 async function main() {
   console.log('🤖 Autopilot Agent started');
-  console.log('   🌙 Luna (Qualify) | 🎵 Aria (Implement) | ⭐ Nova (Review & Deploy)');
+  console.log('   🌙 Luna (Qualify) | 🎵 Aria (Implement) | ⭐ Nova (Review & Deploy) | 💫 Stella (Monitor)');
   console.log(`   Polling every ${POLL_INTERVAL / 1000}s, max ${MAX_CONCURRENT} concurrent tasks`);
   console.log(`   Auth mode: ${API_KEY ? 'API Key' : 'Service Key (legacy)'}`);
 
@@ -905,7 +1031,6 @@ async function main() {
   }
 
   console.log('');
-  if (!API_KEY) await recoverStuckTasks();
   await heartbeat();
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -919,6 +1044,7 @@ async function main() {
   while (true) {
     try {
       await heartbeat();
+      await stellaMonitor();
       await pollAndDispatch();
     } catch (e) {
       console.error('Poll error:', e.message);
