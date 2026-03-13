@@ -1167,11 +1167,104 @@ Quy tắc:
   };
 }
 
+async function preflight() {
+  const issues = [];
+  console.log('🔍 Preflight checks...');
+
+  // 1. Check Claude CLI
+  if (process.platform === 'win32') {
+    const npmGlobal = (process.env.APPDATA || '') + '/npm';
+    const cliPath = npmGlobal + '/node_modules/@anthropic-ai/claude-code/cli.js';
+    if (existsSync(cliPath)) {
+      console.log('   ✅ Claude CLI: found (node direct)');
+    } else {
+      issues.push('Claude CLI not found at ' + cliPath);
+      console.error('   ❌ Claude CLI: not found at', cliPath);
+      console.error('      Run: npm install -g @anthropic-ai/claude-code');
+    }
+  } else {
+    try {
+      const { execSync } = await import('child_process');
+      const ver = execSync('claude --version', { stdio: 'pipe', timeout: 5000 }).toString().trim();
+      console.log(`   ✅ Claude CLI: ${ver}`);
+    } catch {
+      issues.push('Claude CLI not found in PATH');
+      console.error('   ❌ Claude CLI: not found — run: npm install -g @anthropic-ai/claude-code');
+    }
+  }
+
+  // 2. Check Node.js
+  console.log(`   ✅ Node.js: ${process.version} (${process.execPath})`);
+
+  // 3. Check env vars
+  if (!config.supabaseUrl) {
+    issues.push('SUPABASE_URL not set');
+    console.error('   ❌ SUPABASE_URL: missing');
+  } else {
+    console.log(`   ✅ Supabase URL: ${config.supabaseUrl}`);
+  }
+
+  if (!API_KEY && !config.supabaseServiceKey) {
+    issues.push('No API key or service key configured');
+    console.error('   ❌ Auth: no API key or service key — run: node setup.js');
+  } else {
+    console.log(`   ✅ Auth: ${API_KEY ? 'API Key (' + API_KEY.slice(0, 10) + '...)' : 'Service Key (legacy)'}`);
+  }
+
+  // 4. Check Supabase connection via heartbeat endpoint
+  try {
+    const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-heartbeat`, {
+      method: 'POST',
+      headers: API_KEY ? agentHeaders() : { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_id: config.machineId || 'preflight', active_tasks: 0 }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      console.log('   ✅ Supabase connection: OK');
+    } else {
+      const txt = await res.text().catch(() => '');
+      if (res.status === 401) {
+        issues.push('Supabase auth failed (401) — check API key');
+        console.error('   ❌ Supabase connection: 401 Unauthorized');
+      } else {
+        console.warn(`   ⚠️ Supabase connection: HTTP ${res.status} ${txt.slice(0, 80)}`);
+      }
+    }
+  } catch (e) {
+    issues.push('Cannot reach Supabase: ' + e.message);
+    console.error('   ❌ Supabase connection:', e.message);
+  }
+
+  // 5. Check APPDATA (Windows-specific)
+  if (process.platform === 'win32') {
+    if (!process.env.APPDATA) {
+      issues.push('APPDATA env var missing');
+      console.error('   ❌ APPDATA: not set');
+    }
+    if (!process.env.ComSpec) {
+      console.warn('   ⚠️ ComSpec: not set (using node direct mode, OK)');
+    }
+  }
+
+  if (issues.length > 0) {
+    console.error(`\n⚠️ ${issues.length} issue(s) found — agent may not work correctly:`);
+    for (const i of issues) console.error(`   • ${i}`);
+    console.error('');
+  } else {
+    console.log('   All checks passed ✅\n');
+  }
+
+  return issues;
+}
+
 async function main() {
   console.log('🤖 Autopilot Agent started');
   console.log('   🌙 Luna (Qualify) | 🎵 Aria (Implement) | ⭐ Nova (Review & Deploy) | 💫 Stella (Monitor)');
   console.log(`   Polling every ${POLL_INTERVAL / 1000}s, max ${MAX_CONCURRENT} concurrent tasks`);
-  console.log(`   Auth mode: ${API_KEY ? 'API Key' : 'Service Key (legacy)'}`);
+  console.log('');
+
+  // Preflight: verify all dependencies before entering main loop
+  const preflightIssues = await preflight();
 
   // Load project configs if using API key
   if (API_KEY) {
@@ -1191,12 +1284,19 @@ async function main() {
           console.error('   ❌ 401 Invalid JWT — Edge Functions need --no-verify-jwt');
           console.error('   See: https://github.com/nghiant8x/auto-pilot-public#troubleshooting--xu-ly-loi');
         } else {
-          console.error('   Failed to fetch configs — check API key');
+          console.error('   ❌ Failed to fetch configs — check API key');
         }
       }
     } catch (e) {
-      console.error('   Failed to connect:', e.message);
+      console.error('   ❌ Failed to connect:', e.message);
     }
+  }
+
+  // Abort if critical issues (no CLI, no auth)
+  const critical = preflightIssues.filter(i => i.includes('CLI') || i.includes('API key') || i.includes('service key'));
+  if (critical.length > 0) {
+    console.error('🛑 Critical issues found — fix them before running agent.');
+    process.exit(1);
   }
 
   console.log('');
