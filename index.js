@@ -681,13 +681,19 @@ async function processAgent(handler, task, project) {
     });
   } catch (e) {
     console.error(`[${task.id.slice(0, 8)}] Fatal error:`, e.message);
-    await updateTask(task.id, { status: 'failed' });
-    await log(task.id, `Fatal error: ${e.message}`);
-    await reportStellaStatus(task.project_id, {
-      last_error: e.message,
-      last_active_at: new Date().toISOString(),
-      stella_message: null,
-    });
+    try {
+      await updateTask(task.id, { status: 'failed' });
+    } catch (updateErr) {
+      console.error(`[${task.id.slice(0, 8)}] Could not mark as failed:`, updateErr.message);
+    }
+    try { await log(task.id, `Fatal error: ${e.message}`); } catch {}
+    try {
+      await reportStellaStatus(task.project_id, {
+        last_error: e.message,
+        last_active_at: new Date().toISOString(),
+        stella_message: null,
+      });
+    } catch {}
   } finally {
     activeTasks.delete(task.id);
   }
