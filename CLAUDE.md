@@ -53,7 +53,7 @@ The response will contain `api_key`. Save it — this is their authentication ke
 
 ### Existing user — use API key
 Ask them to provide their API key (starts with `ap_`).
-They can generate one at https://auto-pilot-tool.vercel.app (Profile → API Keys → Generate).
+They can generate one at https://auto-pilot-tool.online (Profile → API Keys → Generate).
 
 ### Verify the API key works
 ```bash
@@ -257,7 +257,7 @@ Tell the user:
 Chúc mừng! Autopilot Agent đã được cài đặt thành công!
 
 Bây giờ bạn có thể:
-- Mở web app tại https://auto-pilot-tool.vercel.app để tạo task
+- Mở web app tại https://auto-pilot-tool.online để tạo task
 - Agent sẽ tự động nhận task và xử lý
 - Luna đánh giá yêu cầu → Aria implement → Nova review & deploy
 
@@ -269,5 +269,5 @@ Chúc bạn làm việc hiệu quả với Autopilot!
 - NEVER expose the full API key in output — show only first 11 chars (e.g. `ap_abc1234...`)
 - If any step fails, explain the error clearly and suggest a fix
 - The `supabase_anon_key` is a publishable key, safe to include in config
-- If user asks about the web app: https://auto-pilot-tool.vercel.app
+- If user asks about the web app: https://auto-pilot-tool.online
 - If user wants to add more projects later, they can run `claude` again in this directory

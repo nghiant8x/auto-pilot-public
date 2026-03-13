@@ -13,7 +13,7 @@ Bạn tạo task trên web → AI đánh giá → AI code → AI review → Depl
 
 ## Phần 1: Sử dụng Web App (cho tất cả thành viên)
 
-**URL**: [auto-pilot-tool.vercel.app](https://auto-pilot-tool.vercel.app)
+**URL**: [auto-pilot-tool.online](https://auto-pilot-tool.online)
 
 ### Đăng ký & Đăng nhập
 
@@ -165,7 +165,7 @@ verify_jwt = false
 verify_jwt = false
 ```
 
-> **Lưu ý**: Nếu bạn dùng Autopilot hosted (auto-pilot-tool.vercel.app), lỗi này đã được khắc phục ở server. Nếu vẫn gặp lỗi, hãy liên hệ admin.
+> **Lưu ý**: Nếu bạn dùng Autopilot hosted (auto-pilot-tool.online), lỗi này đã được khắc phục ở server. Nếu vẫn gặp lỗi, hãy liên hệ admin.
 
 ### Lỗi "Claude CLI not found"
 

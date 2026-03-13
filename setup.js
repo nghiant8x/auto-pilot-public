@@ -92,7 +92,7 @@ async function main() {
 
   if (hasAccount.toLowerCase() === 'y') {
     // Existing user — enter API key
-    console.log('\n  Enter your API key from https://auto-pilot-tool.vercel.app');
+    console.log('\n  Enter your API key from https://auto-pilot-tool.online');
     console.log('  (Profile → API Keys → Generate)\n');
 
     apiKey = await ask('  API key (ap_...): ');
