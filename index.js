@@ -60,25 +60,38 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
     if (systemPrompt) claudeArgs.push('--system-prompt', systemPrompt);
 
     // Sanitize environment — strip sensitive vars before passing to Claude
-    const SENSITIVE_ENV_PREFIXES = [
+    const SENSITIVE_PATTERNS = [
       'SUPABASE_', 'AWS_', 'AZURE_', 'GCP_', 'GOOGLE_', 'DATABASE_', 'DB_',
-      'REDIS_', 'MONGO_', 'POSTGRES_', 'MYSQL_', 'SECRET', 'TOKEN', 'PRIVATE',
-      'CREDENTIAL', 'PASSWORD', 'API_KEY', 'OPENAI_', 'ANTHROPIC_', 'STRIPE_',
-      'TWILIO_', 'SENDGRID_', 'SMTP_', 'FIREBASE_', 'GITHUB_TOKEN', 'NPM_TOKEN',
+      'REDIS_', 'MONGO_', 'POSTGRES_', 'MYSQL_', 'OPENAI_', 'ANTHROPIC_',
+      'STRIPE_', 'TWILIO_', 'SENDGRID_', 'SMTP_', 'FIREBASE_',
     ];
-    const env = {};
-    for (const [k, v] of Object.entries(process.env)) {
+    const SENSITIVE_EXACT = ['CLAUDECODE', 'SUPABASE_SERVICE_KEY', 'API_KEY', 'GITHUB_TOKEN', 'NPM_TOKEN'];
+    const env = { ...process.env };
+    for (const k of Object.keys(env)) {
       const upper = k.toUpperCase();
-      if (upper === 'CLAUDECODE') continue;
-      if (SENSITIVE_ENV_PREFIXES.some(prefix => upper.startsWith(prefix) || upper.includes('SECRET') || upper.includes('PASSWORD') || upper.includes('TOKEN'))) continue;
-      env[k] = v;
+      if (SENSITIVE_EXACT.includes(upper)) { delete env[k]; continue; }
+      if (SENSITIVE_PATTERNS.some(p => upper.startsWith(p))) { delete env[k]; continue; }
+      if (upper.includes('SECRET') || upper.includes('PASSWORD')) { delete env[k]; }
     }
 
-    const child = spawn('claude', ['-p', ...claudeArgs], {
+    // Resolve claude CLI: on Windows use node + cli.js directly (no shell needed)
+    let spawnCmd = 'claude';
+    let spawnArgs = ['-p', ...claudeArgs];
+    let useShell = true;
+    if (process.platform === 'win32') {
+      const npmGlobal = (process.env.APPDATA || '') + '/npm';
+      const cliPath = npmGlobal + '/node_modules/@anthropic-ai/claude-code/cli.js';
+      if (existsSync(cliPath)) {
+        spawnCmd = process.execPath;
+        spawnArgs = [cliPath, '-p', ...claudeArgs];
+        useShell = false;
+      }
+    }
+    const child = spawn(spawnCmd, spawnArgs, {
       cwd: cwd || process.cwd(),
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: true,
+      shell: useShell,
     });
 
     // Pipe prompt via stdin (cross-platform, no bash dependency)
@@ -886,7 +899,7 @@ function stellaLog(message) {
 async function checkClaudeCli() {
   try {
     const { execSync } = await import('child_process');
-    execSync('claude --version', { stdio: 'pipe', timeout: 5000, shell: true });
+    execSync('claude --version', { stdio: 'pipe', timeout: 5000, shell: process.env.ComSpec || true });
     return { ok: true };
   } catch {
     return { ok: false, message: 'Claude CLI không khả dụng (spawn ENOENT)' };
