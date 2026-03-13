@@ -74,6 +74,13 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
       if (upper.includes('SECRET') || upper.includes('PASSWORD')) { delete env[k]; }
     }
 
+    // Validate cwd exists — spawn throws confusing ENOENT (blaming executable) if cwd is missing
+    const effectiveCwd = cwd || process.cwd();
+    if (!existsSync(effectiveCwd)) {
+      reject(new Error(`Working directory does not exist: ${effectiveCwd}\nPlease check repo_path in your agent config.`));
+      return;
+    }
+
     // Resolve claude CLI: on Windows use node + cli.js directly (no shell needed)
     let spawnCmd = 'claude';
     let spawnArgs = ['-p', ...claudeArgs];
@@ -88,7 +95,7 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
       }
     }
     const child = spawn(spawnCmd, spawnArgs, {
-      cwd: cwd || process.cwd(),
+      cwd: effectiveCwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: useShell,
@@ -128,7 +135,7 @@ function claudeQuery({ prompt, cwd, allowedTools, systemPrompt, maxTurns }) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
-      reject(new Error(`Claude CLI error: ${err.message}`));
+      reject(new Error(`Claude CLI error: ${err.message}\n  cmd: ${spawnCmd}\n  cwd: ${effectiveCwd}\n  shell: ${useShell}`));
     });
   });
 }
@@ -760,6 +767,17 @@ async function pollAndDispatch() {
       delete row.projects;
       delete row.agent_config;
 
+      // Validate repo_path exists before starting agent
+      if (!project.repo_path || !existsSync(project.repo_path)) {
+        const reason = !project.repo_path
+          ? 'no repo_path configured'
+          : `repo_path does not exist: ${project.repo_path}`;
+        console.error(`   ❌ Skipping task ${row.task_number || row.id}: ${reason}`);
+        await updateTask(row.id, { status: 'failed' });
+        await log(row.id, `❌ Task failed: ${reason}. Run "node setup.js" to configure your project paths.`);
+        continue;
+      }
+
       const handler = row.status === 'draft' ? lunaQualify
         : row.status === 'implemented' ? novaReviewAndDeploy
         : ariaImplement;
@@ -809,12 +827,24 @@ async function pollAndDispatch() {
         .limit(remainingSlots2)
     : { data: [] };
 
-  const dispatch = (tasks, handler, label) => {
+  const dispatch = async (tasks, handler, label) => {
     if (!tasks?.length) return;
     for (const row of tasks) {
       if (activeTasks.has(row.id)) continue;
       const project = row.projects;
       delete row.projects;
+
+      // Validate repo_path exists before starting agent
+      if (!project?.repo_path || !existsSync(project.repo_path)) {
+        const reason = !project?.repo_path
+          ? 'no repo_path configured'
+          : `repo_path does not exist: ${project.repo_path}`;
+        console.error(`   ❌ Skipping task ${row.task_number || row.id}: ${reason}`);
+        await updateTask(row.id, { status: 'failed' });
+        await log(row.id, `❌ Task failed: ${reason}. Run "node setup.js" to configure your project paths.`);
+        continue;
+      }
+
       const title = row.title || row.description?.split('\n')[0]?.slice(0, 60);
       console.log(`\n📋 ${label}: "${title}" [${project.name}]`);
       activeTasks.add(row.id);
@@ -822,9 +852,9 @@ async function pollAndDispatch() {
     }
   };
 
-  dispatch(draftTasks, lunaQualify, '🌙 Luna');
-  dispatch(readyTasks, ariaImplement, '🎵 Aria');
-  dispatch(implementedTasks, novaReviewAndDeploy, '⭐ Nova');
+  await dispatch(draftTasks, lunaQualify, '🌙 Luna');
+  await dispatch(readyTasks, ariaImplement, '🎵 Aria');
+  await dispatch(implementedTasks, novaReviewAndDeploy, '⭐ Nova');
 }
 
 let totalCompleted = 0;
@@ -1277,6 +1307,14 @@ async function main() {
         if (configs) {
           for (const c of configs) projectConfigs.set(c.project_id, c);
           console.log(`   Projects configured: ${configs.length}`);
+          // Warn about missing repo_paths at startup
+          for (const c of configs) {
+            if (!c.repo_path) {
+              console.warn(`   ⚠️ Project ${c.project_id.slice(0, 8)}: no repo_path configured`);
+            } else if (!existsSync(c.repo_path)) {
+              console.warn(`   ⚠️ Project ${c.project_id.slice(0, 8)}: repo_path does not exist: ${c.repo_path}`);
+            }
+          }
         }
       } else {
         const text = await res.text().catch(() => '');
