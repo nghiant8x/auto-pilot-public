@@ -86,84 +86,160 @@ Bạn kiểm tra → Xác nhận "Done" ✓
 
 ## Phần 2: Cài đặt Agent trên máy tính (cho dev)
 
-Agent là chương trình chạy trên máy dev, nhận task từ web app và dùng Claude Code CLI để tự động code.
+Agent chạy trên máy dev, nhận task từ web app và dùng Claude Code để tự động code.
 
-### Yêu cầu
-
-- [Node.js](https://nodejs.org/) v18+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) (đã đăng nhập)
-- Git (đã cấu hình)
-- Repo dự án đã clone về máy
-
-### Cài đặt
+### Bước 1: Cài Claude Code CLI
 
 ```bash
-# Cách 1: Clone repo
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+Cần tài khoản Claude (Pro/Max) hoặc Anthropic API key. Chi tiết: [docs.anthropic.com/en/docs/claude-code](https://docs.anthropic.com/en/docs/claude-code/overview)
+
+### Bước 2: Cài Agent & chạy
+
+```bash
 git clone https://github.com/nghiant8x/auto-pilot-public.git
 cd auto-pilot-public
 npm install
-
-# Cách 2: npm global
-npm install -g autopilot-agent
-```
-
-### Thiết lập
-
-```bash
-node setup.js
-# hoặc: autopilot setup
+node setup.js    # Nhập API key (lấy từ web app), chọn project, đường dẫn repo
+node index.js    # Chạy agent — tự động nhận task và xử lý
 ```
 
 Setup wizard sẽ hỏi:
-1. **API Key** — Lấy từ web app: Profile → API Keys → Generate
-2. **Chọn project** — Chọn project bạn muốn agent xử lý
-3. **Đường dẫn repo** — Thư mục chứa source code trên máy bạn
-4. **Chế độ commit** — `merge` (tự merge vào main) hoặc `pr_only` (tạo PR để bạn review)
+- **API Key** — Lấy từ web app: Profile → API Keys → Generate
+- **Project** — Chọn project bạn muốn agent xử lý
+- **Đường dẫn repo** — Thư mục chứa source code trên máy
+- **Chế độ commit** — `merge` (tự merge) hoặc `pr_only` (tạo PR để review)
 
-### Chạy agent
+---
+
+## Troubleshooting / Xử lý lỗi
+
+### Lỗi 401 "Invalid JWT"
+
+**Triệu chứng**: Khi agent gọi API (setup, poll, heartbeat...) bị trả về:
+```json
+{"code":401,"message":"Invalid JWT"}
+```
+
+**Nguyên nhân**: Supabase Gateway tự động kiểm tra header `Authorization` và coi token `ap_xxx` là JWT (không hợp lệ). Lỗi xảy ra ở Gateway, trước khi request đến được Edge Function code.
+
+**Cách khắc phục** (dành cho người self-host Supabase):
+
+Edge Functions cần được deploy với flag `--no-verify-jwt` để Gateway bỏ qua việc verify JWT:
 
 ```bash
-node index.js
-# hoặc: autopilot start
+# Deploy từng function
+supabase functions deploy agent-projects --no-verify-jwt
+supabase functions deploy agent-poll --no-verify-jwt
+supabase functions deploy agent-update-task --no-verify-jwt
+supabase functions deploy agent-heartbeat --no-verify-jwt
+supabase functions deploy agent-update-config --no-verify-jwt
+supabase functions deploy agent-signup --no-verify-jwt
+supabase functions deploy api-keys --no-verify-jwt
 ```
 
-Agent sẽ:
-- Kết nối đến server, hiển thị trạng thái online
-- Poll task mới mỗi 5 giây
-- Khi có task → tự động xử lý qua pipeline Luna → Aria → Nova
-- Hiển thị log realtime trên terminal
+Hoặc cấu hình trong `supabase/config.toml`:
+```toml
+[functions.agent-projects]
+verify_jwt = false
 
-### Agent làm gì trên máy bạn?
+[functions.agent-poll]
+verify_jwt = false
 
+[functions.agent-update-task]
+verify_jwt = false
+
+[functions.agent-heartbeat]
+verify_jwt = false
+
+[functions.agent-update-config]
+verify_jwt = false
+
+[functions.agent-signup]
+verify_jwt = false
+
+[functions.api-keys]
+verify_jwt = false
 ```
-Agent poll task mới
-    ↓
-🌙 Luna: Đánh giá yêu cầu (chỉ đọc code, không sửa)
-    ↓
-🎵 Aria: Tạo branch → đọc code → implement → commit → push
-    ↓
-⭐ Nova: Review diff → merge hoặc tạo PR → deploy (nếu cấu hình)
-```
 
-- **Luna** chỉ đọc code (Read, Glob, Grep) — không sửa gì
-- **Aria** có quyền đọc/sửa code, chạy lệnh build trong thư mục project
-- **Nova** review diff, merge branch, chạy lệnh deploy
-- Tất cả hoạt động **trong thư mục project** — không truy cập file ngoài
+> **Lưu ý**: Nếu bạn dùng Autopilot hosted (auto-pilot-tool.vercel.app), lỗi này đã được khắc phục ở server. Nếu vẫn gặp lỗi, hãy liên hệ admin.
 
-### Bảo mật
-
-- Agent chỉ hoạt động trong thư mục project đã cấu hình
-- Luna kiểm tra bảo mật yêu cầu trước khi cho Aria code
-- Aria/Nova bị giới hạn: không truy cập file ngoài project, không chạy lệnh mạng, không đọc secrets
-- Xác thực bằng API Key — mỗi user có key riêng
-- Mọi thay đổi đều qua git branch — dễ review và rollback
-
-### Lệnh hữu ích
+### Lỗi "Claude CLI not found"
 
 ```bash
-autopilot start    # Chạy agent
-autopilot status   # Xem cấu hình hiện tại
-autopilot setup    # Cấu hình lại
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+### Agent không nhận task
+
+1. Kiểm tra agent đang chạy: `node index.js`
+2. Kiểm tra project đã được cấu hình: `node setup.js`
+3. Kiểm tra task ở trạng thái `draft`, `qualified`, hoặc `implemented`
+4. Kiểm tra API key còn hoạt động (chưa bị revoke)
+
+---
+
+## Self-hosting / Deploy Edge Functions
+
+Nếu bạn muốn tự host Autopilot với Supabase project riêng:
+
+### 1. Clone repo chính (private)
+
+```bash
+git clone https://github.com/nghiant8x/auto-pilot.git
+cd auto-pilot
+```
+
+### 2. Link Supabase project
+
+```bash
+cd supabase
+supabase link --project-ref YOUR_PROJECT_REF
+```
+
+### 3. Push database migrations
+
+```bash
+supabase db push --linked
+```
+
+### 4. Deploy Edge Functions
+
+**Quan trọng**: Tất cả agent functions phải deploy với `--no-verify-jwt` vì chúng dùng API key auth (`ap_xxx`) thay vì Supabase JWT.
+
+```bash
+# Cách 1: Dùng script có sẵn
+bash deploy-functions.sh
+
+# Cách 2: Deploy thủ công từng function
+supabase functions deploy agent-projects --no-verify-jwt
+supabase functions deploy agent-poll --no-verify-jwt
+supabase functions deploy agent-update-task --no-verify-jwt
+supabase functions deploy agent-heartbeat --no-verify-jwt
+supabase functions deploy agent-update-config --no-verify-jwt
+supabase functions deploy agent-signup --no-verify-jwt
+supabase functions deploy api-keys --no-verify-jwt
+```
+
+### 5. Cập nhật config agent
+
+Trong `config.js` và `setup.js`, đổi `SUPABASE_URL` và `SUPABASE_ANON_KEY` sang project của bạn.
+
+### 6. Test
+
+```bash
+# Test agent-signup (không cần auth)
+curl -s "https://YOUR_PROJECT.supabase.co/functions/v1/agent-signup" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"test123","display_name":"Test"}'
+
+# Test agent-projects (cần API key)
+curl -s "https://YOUR_PROJECT.supabase.co/functions/v1/agent-projects" \
+  -H "Authorization: Bearer ap_YOUR_API_KEY"
 ```
 
 ---

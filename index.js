@@ -21,7 +21,22 @@ const supabase = createClient(config.supabaseUrl, config.supabaseAnonKey);
 
 // If using API key, we call Edge Functions instead of direct DB access
 const API_KEY = config.apiKey;
+const SUPABASE_ANON_KEY = config.supabaseAnonKey;
 const SUPABASE_FUNCTIONS_URL = `${config.supabaseUrl}/functions/v1`;
+
+/**
+ * Build headers for Edge Function calls.
+ * Includes both the API key (for our custom auth) and the Supabase anon key
+ * (apikey header) so the Gateway can route the request properly.
+ */
+function agentHeaders(extraHeaders = {}) {
+  return {
+    'Authorization': `Bearer ${API_KEY}`,
+    'apikey': SUPABASE_ANON_KEY,
+    'Content-Type': 'application/json',
+    ...extraHeaders,
+  };
+}
 
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || '5000');
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3');
@@ -151,7 +166,7 @@ async function updateTask(taskId, updates) {
     // Use Edge Function
     const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-update-task`, {
       method: 'PUT',
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      headers: agentHeaders(),
       body: JSON.stringify({ task_id: taskId, ...updates }),
     });
     if (!res.ok) {
@@ -654,7 +669,7 @@ async function reportStellaStatus(projectId, updates) {
   try {
     await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-update-config`, {
       method: 'PUT',
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      headers: agentHeaders(),
       body: JSON.stringify({ project_id: projectId, ...updates }),
     });
   } catch {}
@@ -694,9 +709,19 @@ async function pollAndDispatch() {
   if (API_KEY) {
     // API Key mode: poll via Edge Function
     const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-poll`, {
-      headers: { 'Authorization': `Bearer ${API_KEY}` },
+      headers: agentHeaders(),
     });
-    if (!res.ok) return;
+    if (!res.ok) {
+      // Detect JWT verification error
+      if (res.status === 401) {
+        const text = await res.text().catch(() => '');
+        if (text.includes('Invalid JWT')) {
+          console.error('   ❌ 401 Invalid JWT — Edge Functions need --no-verify-jwt');
+          console.error('   See: https://github.com/nghiant8x/auto-pilot-public#troubleshooting--xu-ly-loi');
+        }
+      }
+      return;
+    }
     const { tasks: allTasks, configs } = await res.json();
 
     // Update project configs cache
@@ -803,7 +828,7 @@ async function heartbeat() {
   if (API_KEY) {
     await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-heartbeat`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      headers: agentHeaders(),
       body: JSON.stringify(heartbeatData),
     }).catch(() => {});
   } else {
@@ -823,7 +848,7 @@ async function setOffline() {
   if (API_KEY) {
     await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-heartbeat`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      headers: agentHeaders(),
       body: JSON.stringify({
         active_tasks: 0,
         total_completed: totalCompleted,
@@ -866,7 +891,7 @@ async function main() {
   if (API_KEY) {
     try {
       const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/agent-poll`, {
-        headers: { 'Authorization': `Bearer ${API_KEY}` },
+        headers: agentHeaders(),
       });
       if (res.ok) {
         const { configs } = await res.json();
@@ -875,7 +900,13 @@ async function main() {
           console.log(`   Projects configured: ${configs.length}`);
         }
       } else {
-        console.error('   Failed to fetch configs — check API key');
+        const text = await res.text().catch(() => '');
+        if (res.status === 401 && text.includes('Invalid JWT')) {
+          console.error('   ❌ 401 Invalid JWT — Edge Functions need --no-verify-jwt');
+          console.error('   See: https://github.com/nghiant8x/auto-pilot-public#troubleshooting--xu-ly-loi');
+        } else {
+          console.error('   Failed to fetch configs — check API key');
+        }
       }
     } catch (e) {
       console.error('   Failed to connect:', e.message);

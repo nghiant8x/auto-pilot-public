@@ -30,6 +30,7 @@ async function apiCall(apiKey, path, method = 'GET', body = null) {
     method,
     headers: {
       'Authorization': `Bearer ${apiKey}`,
+      'apikey': SUPABASE_ANON_KEY,
       'Content-Type': 'application/json',
     },
   };
@@ -37,6 +38,13 @@ async function apiCall(apiKey, path, method = 'GET', body = null) {
   const res = await fetch(`${API_BASE}/${path}`, opts);
   if (!res.ok) {
     const text = await res.text().catch(() => '');
+    // Detect JWT verification error — Edge Functions need --no-verify-jwt
+    if (res.status === 401 && text.includes('Invalid JWT')) {
+      throw new Error(
+        `401 Invalid JWT — Edge Functions chua duoc deploy voi --no-verify-jwt.\n` +
+        `  Xem huong dan: https://github.com/nghiant8x/auto-pilot-public#troubleshooting--xu-ly-loi`
+      );
+    }
     throw new Error(`API error ${res.status}: ${text}`);
   }
   return res.json();
