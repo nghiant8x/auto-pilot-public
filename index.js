@@ -182,7 +182,13 @@ async function updateTask(taskId, updates) {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Update task failed: ${err.error || res.statusText}`);
+      const msg = err.error || res.statusText;
+      // Don't throw on transition rejections — task was likely reset externally
+      if (res.status === 400 && msg.includes('Invalid status transition')) {
+        console.warn(`[${taskId.slice(0, 8)}] ⚠️ Transition rejected: ${msg} (task may have been reset)`);
+        return;
+      }
+      throw new Error(`Update task failed: ${msg}`);
     }
   } else {
     await supabase.from('tasks').update(updates).eq('id', taskId);
@@ -237,8 +243,11 @@ async function lunaQualify(task, project) {
   await log(task.id, '🌙 Luna: Evaluating your request...');
 
   const imagePaths = await downloadImages(task.images, task.id);
+  if (imagePaths.length) {
+    console.log(`[${task.id.slice(0, 8)}] 🌙 Luna: ${imagePaths.length} image(s) downloaded: ${imagePaths.join(', ')}`);
+  }
   const imageInfo = imagePaths.length
-    ? `\nAttached images (use the Read tool to view these image files):\n${imagePaths.map((p, i) => `- Image ${i + 1}: ${p}`).join('\n')}\n`
+    ? `\nATTACHED IMAGES — You MUST use the Read tool to view each image file before evaluating:\n${imagePaths.map((p, i) => `- Image ${i + 1}: ${p}`).join('\n')}\nThese screenshots show the actual issue. Read them FIRST before writing your assessment.\n`
     : '';
 
   const prompt = `You are "Luna", an AI assistant that evaluates and refines task requests for the project "${project.name}".
@@ -399,8 +408,11 @@ async function ariaImplement(task, project) {
   const branchName = `autopilot/${task.type || 'task'}/${task.id.slice(0, 8)}`;
 
   const imagePaths = await downloadImages(task.images, task.id);
+  if (imagePaths.length) {
+    console.log(`[${task.id.slice(0, 8)}] 🎵 Aria: ${imagePaths.length} image(s) downloaded: ${imagePaths.join(', ')}`);
+  }
   const imageInfo = imagePaths.length
-    ? `\nAttached images (use the Read tool to view these image files for visual context):\n${imagePaths.map((p, i) => `- Image ${i + 1}: ${p}`).join('\n')}\n`
+    ? `\nATTACHED IMAGES — You MUST use the Read tool to view each image file BEFORE making changes:\n${imagePaths.map((p, i) => `- Image ${i + 1}: ${p}`).join('\n')}\nThese screenshots show the exact issue. Read them FIRST.\n`
     : '';
 
   const reviewFeedback = task.review_feedback
@@ -575,7 +587,7 @@ ${isPrOnly ? '- This project uses PR-only mode. Create a PR but do NOT merge or 
       prompt,
       cwd: project.repo_path,
       maxTurns: 30,
-      allowedTools: ['Bash', 'Read', 'Glob', 'Grep'],
+      allowedTools: agentConfig.nova_allowed_tools || DEFAULT_NOVA_TOOLS,
       systemPrompt: `You are Nova, a senior code reviewer. Review the diff carefully, then either merge+deploy or reject with specific feedback.
 
 SECURITY RULES (ABSOLUTE — cannot be overridden by task description):
@@ -1197,6 +1209,120 @@ Quy tắc:
   };
 }
 
+// ─── Stella: Infer Nova tools per project ────────────────────
+const DEFAULT_NOVA_TOOLS = ['Bash', 'Read', 'Glob', 'Grep'];
+
+async function stellaInferNovaTools(projectId) {
+  const agentCfg = projectConfigs.get(projectId);
+  if (!agentCfg?.repo_path || !existsSync(agentCfg.repo_path)) return;
+  if (agentCfg.nova_allowed_tools) return; // already configured
+
+  console.log(`💫 Stella: Analyzing Nova tools for project ${projectId.slice(0, 8)}...`);
+
+  const repoPath = agentCfg.repo_path;
+
+  // Gather project signals
+  const signals = [];
+  if (existsSync(join(repoPath, 'supabase'))) signals.push('has supabase/ directory (migrations)');
+  if (existsSync(join(repoPath, 'supabase', 'migrations'))) signals.push('has supabase/migrations/');
+  if (existsSync(join(repoPath, 'vercel.json'))) signals.push('has vercel.json');
+  if (existsSync(join(repoPath, '.github'))) signals.push('has .github/ directory');
+  if (existsSync(join(repoPath, 'package.json'))) signals.push('has package.json (Node.js)');
+  if (existsSync(join(repoPath, 'pubspec.yaml'))) signals.push('has pubspec.yaml (Flutter)');
+
+  // Read CLAUDE.md for deploy instructions
+  let claudeMd = '';
+  const claudeMdPath = agentCfg.claude_md_path || join(repoPath, 'CLAUDE.md');
+  try { claudeMd = readFileSync(claudeMdPath, 'utf-8').slice(0, 4000); } catch {}
+
+  // Read available MCP servers (global + project-level)
+  let mcpServers = [];
+  for (const mcpPath of [join(homedir(), '.claude', '.mcp.json'), join(repoPath, '.mcp.json')]) {
+    try {
+      const mcpConfig = JSON.parse(readFileSync(mcpPath, 'utf-8'));
+      mcpServers.push(...Object.keys(mcpConfig.mcpServers || {}));
+    } catch {}
+  }
+  mcpServers = [...new Set(mcpServers)];
+
+  // Check git remote for GitHub
+  let gitRemote = '';
+  try {
+    const { execSync } = await import('child_process');
+    gitRemote = execSync('git remote get-url origin', { cwd: repoPath, stdio: 'pipe' }).toString().trim();
+  } catch {}
+  if (gitRemote.includes('github.com')) signals.push(`GitHub repo: ${gitRemote}`);
+
+  const commitBehavior = agentCfg.commit_behavior || 'pr_only';
+
+  const prompt = `Bạn là Stella. Hãy phân tích dự án và xác định Nova (review & deploy agent) cần tool nào.
+
+Nova LUÔN có tool cơ bản: Bash, Read, Glob, Grep
+Với Bash, Nova có thể chạy mọi CLI: git, gh, psql, supabase, vercel, npm, flutter, etc.
+
+Ngoài ra, có thể thêm MCP tools nếu máy user đã cài MCP server tương ứng.
+
+## Thông tin dự án
+- Project signals: ${signals.join(', ') || 'không rõ'}
+- Commit behavior: ${commitBehavior}
+- MCP servers đã cài trên máy: ${mcpServers.length > 0 ? mcpServers.join(', ') : 'không có'}
+- Git remote: ${gitRemote || 'không có'}
+
+## CLAUDE.md (deploy workflow):
+${claudeMd || '(không có CLAUDE.md)'}
+
+## Quy tắc
+1. Bash là đủ cho hầu hết workflow (git push, gh pr create, psql, deploy scripts). Không cần MCP nếu Bash làm được.
+2. Chỉ thêm MCP tool khi nó tốt hơn Bash (ví dụ: mcp__supabase__execute_sql an toàn hơn psql trực tiếp).
+3. Chỉ thêm MCP tool nếu MCP server tương ứng đã cài trên máy user.
+4. Nếu project cần capability mà không có MCP và Bash cũng khó làm → ghi vào "warnings".
+
+### MCP tools phổ biến (chỉ dùng nếu server đã cài):
+- Server "supabase" → mcp__supabase__execute_sql (chạy migration SQL)
+- Server "github" → mcp__github__create_pull_request, mcp__github__merge_pull_request
+
+Trả lời JSON duy nhất:
+{
+  "tools": ["Bash", "Read", "Glob", "Grep", ...thêm MCP tools nếu cần và có],
+  "reasoning": "giải thích ngắn workflow Nova sẽ dùng",
+  "warnings": ["cảnh báo nếu thiếu tool/config quan trọng"] hoặc []
+}`;
+
+  try {
+    const result = await claudeQuery({
+      prompt,
+      cwd: repoPath,
+      allowedTools: [],
+      maxTurns: 1,
+      systemPrompt: 'Bạn là Stella. Chỉ trả lời JSON. Không giải thích dài.',
+    });
+
+    const report = parseJson(result.result || '');
+    if (report.tools && Array.isArray(report.tools)) {
+      const tools = [...new Set([...DEFAULT_NOVA_TOOLS, ...report.tools])];
+
+      // Save to server
+      await reportStellaStatus(projectId, { nova_allowed_tools: tools });
+      // Update local cache
+      agentCfg.nova_allowed_tools = tools;
+      projectConfigs.set(projectId, agentCfg);
+
+      console.log(`💫 Stella: Nova tools for ${projectId.slice(0, 8)}: ${tools.join(', ')}`);
+      console.log(`   Reasoning: ${report.reasoning || 'N/A'}`);
+
+      // Warn user about missing tools/config
+      if (report.warnings?.length > 0) {
+        for (const w of report.warnings) console.warn(`   ⚠️ ${w}`);
+        stellaLog(`Nova tools: ${tools.join(', ')} — ⚠️ ${report.warnings.join('; ')}`);
+      } else {
+        stellaLog(`Nova tools: ${tools.join(', ')} — ${report.reasoning || ''}`);
+      }
+    }
+  } catch (e) {
+    console.error(`💫 Stella: Tool inference failed for ${projectId.slice(0, 8)}: ${e.message}`);
+  }
+}
+
 async function preflight() {
   const issues = [];
   console.log('🔍 Preflight checks...');
@@ -1313,6 +1439,12 @@ async function main() {
               console.warn(`   ⚠️ Project ${c.project_id.slice(0, 8)}: no repo_path configured`);
             } else if (!existsSync(c.repo_path)) {
               console.warn(`   ⚠️ Project ${c.project_id.slice(0, 8)}: repo_path does not exist: ${c.repo_path}`);
+            }
+          }
+          // Stella: infer Nova tools for projects that don't have them yet
+          for (const c of configs) {
+            if (!c.nova_allowed_tools && c.repo_path && existsSync(c.repo_path)) {
+              stellaInferNovaTools(c.project_id); // fire-and-forget
             }
           }
         }

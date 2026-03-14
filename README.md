@@ -113,6 +113,64 @@ Setup wizard sẽ hỏi:
 - **Đường dẫn repo** — Thư mục chứa source code trên máy
 - **Chế độ commit** — `merge` (tự merge) hoặc `pr_only` (tạo PR để review)
 
+### Bước 3: Chuẩn bị CLAUDE.md cho dự án
+
+Agent đọc file `CLAUDE.md` ở thư mục gốc của repo để hiểu cách build, test, và **deploy** dự án. Nếu chưa có, hãy tạo file này với ít nhất:
+
+```markdown
+# CLAUDE.md
+
+## Build & Run
+flutter build web --release   # hoặc npm run build, etc.
+
+## Deployment
+<!-- Hướng dẫn deploy cụ thể — Nova cần phần này để tự deploy -->
+1. Build: ...
+2. Deploy server (migration): ...
+3. Deploy client: ...
+```
+
+> **Quan trọng**: Nếu CLAUDE.md không có mục Deployment, Stella sẽ cảnh báo và Nova sẽ chỉ merge/tạo PR mà không deploy.
+
+### Bước 4 (tùy chọn): Cấu hình MCP servers
+
+Khi agent khởi động, **Stella** tự phân tích dự án để xác định Nova cần những tool nào (tạo PR, merge, chạy migration...). Nếu dự án dùng GitHub hoặc Supabase, bạn có thể cài MCP servers để Nova làm việc hiệu quả hơn.
+
+**GitHub MCP** — Tạo/merge PR trực tiếp (thay vì dùng `gh` CLI):
+```bash
+# Thêm vào ~/.claude/.mcp.json hoặc <project>/.mcp.json
+{
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+**Supabase MCP** — Chạy migration SQL an toàn:
+```bash
+{
+  "mcpServers": {
+    "supabase": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@supabase/mcp-server-supabase@latest"],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "sbp_YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+> **Không bắt buộc**: Nova đã có tool `Bash` nên có thể dùng `gh`, `psql`, `supabase` CLI trực tiếp. MCP chỉ tiện hơn. Stella sẽ tự detect MCP nào có sẵn và cấp quyền phù hợp cho Nova.
+
 ---
 
 ## Troubleshooting / Xử lý lỗi
